@@ -88,6 +88,7 @@ typedef struct
     id              avf_delegate;
     dispatch_queue_t dispatch_queue;
 
+    int             list_video_formats;
     AVRational      framerate;
     int             width, height;
 
@@ -333,17 +334,19 @@ static int add_video_device(AVFormatContext *s, AVCaptureDevice *video_device)
             av_log (s, AV_LOG_ERROR, "An error occurred: %s", [exception.reason UTF8String]);
             return AVERROR_EXTERNAL;
         } else {
-            // video_device API does not contain "formats" selector
+            // AVCaptureScreenInput does not contain formats property
             // get the screen dimensions using CoreGraphics and display id
 #if !TARGET_OS_IPHONE && __MAC_OS_X_VERSION_MIN_REQUIRED >= 1070
-            uint32_t num_screens    = 0;
+            uint32_t num_screens = 0;
             CGGetActiveDisplayList(0, NULL, &num_screens);
             if (ctx->video_device_index < ctx->num_video_devices + num_screens) {
                 CGDirectDisplayID screens[num_screens];
                 CGGetActiveDisplayList(num_screens, screens, &num_screens);
                 int screen_idx = ctx->video_device_index - ctx->num_video_devices;
-                ctx->width  = CGDisplayPixelsWide(screen_idx);
-                ctx->height = CGDisplayPixelsHigh(screen_idx);
+                CGDisplayModeRef mode = CGDisplayCopyDisplayMode(screens[screen_idx]);
+                ctx->width  = CGDisplayModeGetWidth(mode);
+                ctx->height = CGDisplayModeGetHeight(mode);
+                CFRelease(mode);
             }
 #endif
         }
@@ -683,7 +686,7 @@ static int avf_read_header(AVFormatContext *s)
         } else {
             for (AVCaptureDevice *device in devices) {
                 if (!strncmp(ctx->video_filename, [[device localizedName] UTF8String], strlen(ctx->video_filename))) {
-                    video_device = device;
+                    video_device = device; // XXX set device index
                     break;
                 }
         }
@@ -728,6 +731,50 @@ static int avf_read_header(AVFormatContext *s)
         }
     }
 
+    // list all video formats if requested
+    if (ctx->list_video_formats) {
+        int idx = 0;
+        if (capture_screen) {
+            // AVCaptureScreenInput does not contain "formats" property
+            // get the screen dimensions using CoreGraphics and display id
+#if !TARGET_OS_IPHONE && __MAC_OS_X_VERSION_MIN_REQUIRED >= 1070
+            uint32_t num_screens = 0;
+            CGGetActiveDisplayList(0, NULL, &num_screens);
+            if (ctx->video_device_index < ctx->num_video_devices + num_screens) {
+                CGDirectDisplayID screens[num_screens];
+                CGGetActiveDisplayList(num_screens, screens, &num_screens);
+                int screen_idx = ctx->video_device_index - ctx->num_video_devices;
+                CGDisplayModeRef mode = CGDisplayCopyDisplayMode(screens[screen_idx]);
+                CMVideoDimensions dimensions = {CGDisplayModeGetWidth(mode), CGDisplayModeGetHeight(mode)};
+                av_log(ctx, AV_LOG_INFO, "Format %d:\n", idx++);
+                av_log(ctx, AV_LOG_INFO, "\tresolution = %dx%d\n", dimensions.width, dimensions.height);
+                CFRelease(mode);
+            }
+#endif
+        } else {
+            for (AVCaptureDeviceFormat *format in video_device.formats) {
+                CMVideoDimensions dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription);
+
+                av_log(ctx, AV_LOG_INFO, "Format %d:\n", idx++);
+                av_log(ctx, AV_LOG_INFO, "\tresolution = %dx%d\n", dimensions.width, dimensions.height);
+                /*
+                AudioStreamBasicDescription *audio_format_desc = (AudioStreamBasicDescription*)CMAudioFormatDescriptionGetStreamBasicDescription(format.formatDescription);
+                av_log(ctx, AV_LOG_INFO, "Format %d:\n", idx++);
+                av_log(ctx, AV_LOG_INFO, "\tsample rate     = %f\n", audio_format_desc->mSampleRate);
+                av_log(ctx, AV_LOG_INFO, "\tchannels        = %d\n", audio_format_desc->mChannelsPerFrame);
+                av_log(ctx, AV_LOG_INFO, "\tbits per sample = %d\n", audio_format_desc->mBitsPerChannel);
+                av_log(ctx, AV_LOG_INFO, "\tfloat           = %d\n", (bool)(audio_format_desc->mFormatFlags & kAudioFormatFlagIsFloat));
+                av_log(ctx, AV_LOG_INFO, "\tbig endian      = %d\n", (bool)(audio_format_desc->mFormatFlags & kAudioFormatFlagIsBigEndian));
+                av_log(ctx, AV_LOG_INFO, "\tsigned integer  = %d\n", (bool)(audio_format_desc->mFormatFlags & kAudioFormatFlagIsSignedInteger));
+                av_log(ctx, AV_LOG_INFO, "\tpacked          = %d\n", (bool)(audio_format_desc->mFormatFlags & kAudioFormatFlagIsPacked));
+                av_log(ctx, AV_LOG_INFO, "\tnon interleaved = %d\n", (bool)(audio_format_desc->mFormatFlags & kAudioFormatFlagIsNonInterleaved));
+                */
+            }
+        }
+
+        goto fail;
+    }
+
     // select audio device by index
     if (ctx->audio_device_index >= 0) {
         NSArray *devices = [AVCaptureDevice devicesWithMediaType:AVMediaTypeAudio];
@@ -747,7 +794,7 @@ static int avf_read_header(AVFormatContext *s)
 
             for (AVCaptureDevice *device in devices) {
                 if (!strncmp(ctx->audio_filename, [[device localizedName] UTF8String], strlen(ctx->audio_filename))) {
-                    audio_device = device;
+                    audio_device = device; // XXX set device index
                     break;
                 }
             }
@@ -1040,6 +1087,9 @@ static const AVOption options[] = {
     { "list_devices", "list available devices", offsetof(AVFContext, list_devices), AV_OPT_TYPE_INT, {.i64=0}, 0, 1, AV_OPT_FLAG_DECODING_PARAM, "list_devices" },
     { "true", "", 0, AV_OPT_TYPE_CONST, {.i64=1}, 0, 0, AV_OPT_FLAG_DECODING_PARAM, "list_devices" },
     { "false", "", 0, AV_OPT_TYPE_CONST, {.i64=0}, 0, 0, AV_OPT_FLAG_DECODING_PARAM, "list_devices" },
+    { "list_video_formats", "list available video formats", offsetof(AVFContext, list_video_formats), AV_OPT_TYPE_INT, {.i64=0}, 0, 1, AV_OPT_FLAG_DECODING_PARAM, "list_video_formats" },
+    { "true", "", 0, AV_OPT_TYPE_CONST, {.i64=1}, 0, 0, AV_OPT_FLAG_DECODING_PARAM, "list_video_formats" },
+    { "false", "", 0, AV_OPT_TYPE_CONST, {.i64=0}, 0, 0, AV_OPT_FLAG_DECODING_PARAM, "list_video_formats" },
     { "list_audio_formats", "list available audio formats", offsetof(AVFContext, list_audio_formats), AV_OPT_TYPE_INT, {.i64=0}, 0, 1, AV_OPT_FLAG_DECODING_PARAM, "list_audio_formats" },
     { "true", "", 0, AV_OPT_TYPE_CONST, {.i64=1}, 0, 0, AV_OPT_FLAG_DECODING_PARAM, "list_audio_formats" },
     { "false", "", 0, AV_OPT_TYPE_CONST, {.i64=0}, 0, 0, AV_OPT_FLAG_DECODING_PARAM, "list_audio_formats" },
